@@ -158,7 +158,9 @@ impl Sampler<'_> {
         if weight > 1e-12 { (sum / weight) as f32 } else { f32::NAN }
     }
 
-    /// Catmull-Rom over the sixteen pixels around the position; `None` where one has no value.
+    /// Catmull-Rom over the sixteen pixels around the position; `None` where one has no value,
+    /// and for a colour band unless all sixteen have the same alpha above 0 (bilinear, which
+    /// weighs colours by alpha, takes the rest).
     fn cubic(&self, b: usize, index: &dyn Fn(i64, i64) -> usize, i0: i64, j0: i64, fu: f64, fv: f64) -> Option<f32> {
         let kernel = |t: f64| {
             [
@@ -169,10 +171,20 @@ impl Sampler<'_> {
             ]
         };
         let (wx, wy) = (kernel(fu), kernel(fv));
+        let weighted = self.alpha.filter(|a| *a != b);
+        let mut alpha = None;
         let mut sum = 0.0f64;
         for (dj, wj) in wy.iter().enumerate() {
             for (di, wi) in wx.iter().enumerate() {
-                let v = self.at(b, index(i0 + di as i64 - 1, j0 + dj as i64 - 1))?;
+                let idx = index(i0 + di as i64 - 1, j0 + dj as i64 - 1);
+                if let Some(a) = weighted {
+                    // A see-through pixel's colour mustn't count.
+                    let k = self.at(a, idx)?;
+                    if k <= 0.0 || *alpha.get_or_insert(k) != k {
+                        return None;
+                    }
+                }
+                let v = self.at(b, idx)?;
                 sum += f64::from(v) * wi * wj;
             }
         }
@@ -452,6 +464,28 @@ mod tests {
         // Nearest keeps only the two values.
         let out = warp(&r, &fit, &opts(Some(2.0), Resampling::Nearest)).unwrap();
         assert!(out.bands[0].data.iter().filter(|v| v.is_finite()).all(|v| *v == 0.0 || *v == 100.0));
+    }
+
+    #[test]
+    fn cubic_takes_no_colour_from_see_through_pixels() {
+        // Opaque red on the left, see-through green on the right.
+        let (w, h) = (30u32, 30u32);
+        let half = |a: f32, b: f32| (0..w * h).map(|i| if i % w < 15 { a } else { b }).collect::<Vec<f32>>();
+        let bands = vec![half(255.0, 0.0), half(0.0, 255.0), half(0.0, 0.0), half(255.0, 0.0)];
+        let r = scan(w, h, bands, ColorHint::Rgb { alpha: true }, "UInt8");
+        let map = |c: f64, rw: f64| (500_000.0 + 7.0 * c, 4_000_000.0 - 7.0 * rw);
+        let fit = georef::fit(Kind::Affine, &gcps(30.0, 30.0, map)).unwrap();
+        let out = warp(&r, &fit, &opts(Some(2.0), Resampling::Cubic)).unwrap();
+        let mut edge = 0;
+        for at in 0..out.bands[3].data.len() {
+            let a = out.bands[3].data[at];
+            if a > 0.0 {
+                let rgb = [0, 1, 2].map(|b| out.bands[b].data[at]);
+                assert_eq!(rgb, [255.0, 0.0, 0.0], "cell {at}, alpha {a}");
+                edge += usize::from(a < 255.0);
+            }
+        }
+        assert!(edge > 0, "some cells are partly see-through");
     }
 
     #[test]
